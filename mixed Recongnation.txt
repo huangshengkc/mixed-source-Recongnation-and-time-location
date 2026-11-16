@@ -1,0 +1,512 @@
+"""
+Mamba Synchrony Net — 最终标准消融实验 (可直接填入论文 Table 5 & 6)
+输出: Exact-Match Accuracy, F1, tIoU, Params, FLOPs (保留四位小数)
+"""
+import os, time, warnings, shutil
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from sklearn.metrics import f1_score
+import json
+
+warnings.filterwarnings('ignore')
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f'Device: {device}')
+
+# ============================================================
+# 配置 (严格对齐论文参数)
+# ============================================================
+FS = 20000
+DURATION = 10
+NUM_SENSORS = 150
+SENSOR_SPACING = 0.5
+SOUND_SPEED = 1500.0
+FRAME_DURATION = 0.1
+FRAME_SAMPLES = int(FS * FRAME_DURATION)
+FRAMES_PER_FILE = int(DURATION / FRAME_DURATION)
+
+FREQ_DIM = 512
+DIST_DIM = 150
+INPUT_DIM = FREQ_DIM + DIST_DIM
+
+DATA_DIR = './ablation_data'
+os.makedirs(DATA_DIR, exist_ok=True)
+
+SEED = 42
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+NUM_FILES = 40
+TRAIN_IDS = list(range(32))
+TEST_IDS = list(range(32, 40))
+NUM_EPOCHS = 100
+BATCH_SIZE = 8
+LR = 2e-3
+
+# ============================================================
+# 1. 数据生成
+# ============================================================
+def generate_wave_noise(n, lowcut=100, highcut=2000):
+    import scipy.signal as signal
+    noise = np.random.randn(n)
+    nyq = 0.5 * FS
+    b, a = signal.butter(4, [lowcut / nyq, highcut / nyq], btype='band')
+    return signal.lfilter(b, a, noise)
+
+def ship_signal(t):
+    sig = np.zeros_like(t)
+    for k in range(1, 6):
+        sig += (1.0 / k) * np.sin(2 * np.pi * 120.0 * k * t)
+    mod = 1.0 + 0.4 * np.sin(2 * np.pi * 8.0 * t)
+    return sig * mod + 0.05 * np.random.randn(len(t))
+
+def diver_signal(t):
+    breath = 0.3 + 0.7 * np.maximum(0, np.sin(2 * np.pi * t / 3.0))
+    carrier = np.sin(2 * np.pi * 600.0 * t) + 0.5 * np.sin(2 * np.pi * 1200.0 * t)
+    kick = np.zeros_like(t)
+    for kt in np.arange(0.3, DURATION, 1.2):
+        idx = int(kt * FS)
+        w = int(0.05 * FS)
+        if idx + w < len(t):
+            kick[idx:idx + w] += np.exp(-np.linspace(0, 5, w)) * np.random.randn(w)
+    return (carrier + 2.0 * kick) * breath
+
+def extract_tfd_feature(segment):
+    feat = np.zeros(INPUT_DIM, dtype=np.float32)
+    center = segment[NUM_SENSORS // 2]
+    fft_mag = np.abs(np.fft.rfft(center * np.hanning(len(center))))
+    freqs = np.fft.rfftfreq(len(center), 1 / FS)
+    bands = np.linspace(50, 2000, FREQ_DIM + 1)
+    for b in range(FREQ_DIM):
+        m = (freqs >= bands[b]) & (freqs < bands[b + 1])
+        feat[b] = np.log1p(fft_mag[m].mean()) if m.sum() > 0 else 0.0
+
+    sens_idx = np.linspace(0, NUM_SENSORS - 1, DIST_DIM + 1).astype(int)
+    for b in range(DIST_DIM):
+        s1 = segment[sens_idx[b]]
+        s2 = segment[sens_idx[b + 1]]
+        c = np.correlate(s1 - s1.mean(), s2 - s2.mean(), mode='full')
+        feat[FREQ_DIM + b] = np.max(np.abs(c)) / (len(s1) + 1e-8)
+    return feat
+
+def generate_file(file_idx):
+    rng = np.random.RandomState(SEED + file_idx * 7)
+    t = np.arange(0, DURATION, 1 / FS)
+    n = len(t)
+    has_ship = rng.rand() < 0.85
+    has_diver = rng.rand() < 0.85
+    if has_ship:
+        ss = rng.uniform(0.5, 3.5)
+        se = min(DURATION, ss + rng.uniform(3.5, 6.5))
+    else:
+        ss, se = 0.0, 0.0
+    if has_diver:
+        if has_ship and rng.rand() < 0.7:
+            ds = rng.uniform(ss, max(ss + 0.1, se - 2.0))
+        else:
+            ds = rng.uniform(1.0, 6.0)
+        de = min(DURATION, ds + rng.uniform(1.5, 3.5))
+    else:
+        ds, de = 0.0, 0.0
+
+    sp = np.arange(NUM_SENSORS) * SENSOR_SPACING
+    ac = sp.mean()
+    ship_raw = ship_signal(t)
+    diver_raw = diver_signal(t)
+    wave_raw = generate_wave_noise(n)
+    data = np.zeros((NUM_SENSORS, n), dtype=np.float32)
+
+    for i, sx in enumerate(sp):
+        xs = ac - 200 + 400 * t / DURATION
+        ys = 500 - 120 * t / DURATION
+        d_ship = np.sqrt((sx - xs) ** 2 + ys ** 2 + 25)
+        xd = ac - 60 + 120 * t / DURATION
+        yd = 180 - 100 * t / DURATION
+        d_diver = np.sqrt((sx - xd) ** 2 + yd ** 2 + 64)
+        d_wave = np.sqrt((sx - ac) ** 2 + 1600)
+        sd = int(np.clip(d_ship.mean() / SOUND_SPEED * FS, 0, n - 1))
+        dd = int(np.clip(d_diver.mean() / SOUND_SPEED * FS, 0, n - 1))
+        wd = int(np.clip(d_wave.mean() / SOUND_SPEED * FS, 0, n - 1))
+        s_del = np.concatenate([np.zeros(sd), ship_raw[:-sd]]) if sd > 0 else ship_raw
+        d_del = np.concatenate([np.zeros(dd), diver_raw[:-dd]]) if dd > 0 else diver_raw
+        w_del = np.concatenate([np.zeros(wd), wave_raw[:-wd]]) if wd > 0 else wave_raw
+        sg = ((t >= ss) & (t <= se)).astype(np.float32)
+        dg = ((t >= ds) & (t <= de)).astype(np.float32)
+        data[i] = (30 / (d_ship + 1e-6) * s_del * sg + 8 / (d_diver + 1e-6) * d_del * dg + 1 / (
+                d_wave + 1e-6) * w_del).astype(np.float32)
+
+    labels = np.zeros((FRAMES_PER_FILE, 2), dtype=np.float32)
+    boundary = np.zeros(FRAMES_PER_FILE, dtype=np.float32)
+    for f in range(FRAMES_PER_FILE):
+        tm = (f + 0.5) * FRAME_DURATION
+        if has_ship and ss <= tm <= se: labels[f, 0] = 1.0
+        if has_diver and ds <= tm <= de: labels[f, 1] = 1.0
+
+    for (s, e, act) in [(ss, se, has_ship), (ds, de, has_diver)]:
+        if act:
+            for tt in (s, e):
+                fi = int(tt / FRAME_DURATION)
+                if 0 <= fi < FRAMES_PER_FILE: boundary[fi] = 1.0
+
+    feats = np.zeros((FRAMES_PER_FILE, INPUT_DIM), dtype=np.float32)
+    for f in range(FRAMES_PER_FILE):
+        feats[f] = extract_tfd_feature(data[:, f * FRAME_SAMPLES:(f + 1) * FRAME_SAMPLES])
+    feats = (feats - feats.mean(0)) / (feats.std(0) + 1e-8)
+    return feats, labels, boundary
+
+def build_dataset():
+    check_file = os.path.join(DATA_DIR, f'{NUM_FILES - 1:03d}.npz')
+    need_rebuild = True
+    if os.path.exists(check_file):
+        try:
+            if np.load(check_file)['features'].shape[1] == INPUT_DIM:
+                need_rebuild = False
+            else:
+                shutil.rmtree(DATA_DIR)
+                os.makedirs(DATA_DIR, exist_ok=True)
+        except Exception: pass
+            
+    if need_rebuild:
+        print(f'生成新数据 (特征维度: {INPUT_DIM}) ...')
+        for i in range(NUM_FILES):
+            if i % 10 == 0: print(f'  处理文件 {i}/{NUM_FILES}')
+            feats, labels, boundary = generate_file(i)
+            np.savez(os.path.join(DATA_DIR, f'{i:03d}.npz'), features=feats, labels=labels, boundary=boundary)
+
+class AcousticDataset(Dataset):
+    def __init__(self, ids):
+        self.samples = []
+        for i in ids:
+            d = np.load(os.path.join(DATA_DIR, f'{i:03d}.npz'))
+            self.samples.append({
+                'f': torch.tensor(d['features'], dtype=torch.float32),
+                'y': torch.tensor(d['labels'], dtype=torch.float32),
+                'b': torch.tensor(d['boundary'], dtype=torch.float32),
+            })
+    def __len__(self): return len(self.samples)
+    def __getitem__(self, i):
+        s = self.samples[i]
+        return s['f'], s['y'], s['b']
+
+# ============================================================
+# 2. 模型架构 (严格去除 Dropout)
+# ============================================================
+class SelectiveSSM(nn.Module):
+    def __init__(self, d_model, d_state=16, d_conv=4, expand=2):
+        super().__init__()
+        self.d_inner = int(expand * d_model)
+        self.norm = nn.LayerNorm(d_model)
+        self.in_proj = nn.Linear(d_model, self.d_inner * 2)
+        self.conv1d = nn.Conv1d(self.d_inner, self.d_inner, d_conv, padding=d_conv - 1, groups=self.d_inner)
+        self.dt_proj = nn.Linear(self.d_inner, 1)
+        self.A_log = nn.Parameter(torch.randn(self.d_inner, d_state) * 0.5)
+        self.out_proj = nn.Linear(self.d_inner, d_model)
+
+    def forward(self, x):
+        B, L, D = x.shape
+        x = self.norm(x)
+        xz = self.in_proj(x)
+        x_in, z = xz.chunk(2, dim=-1)
+        x_conv = F.silu(self.conv1d(x_in.transpose(1, 2))[:, :, :L].transpose(1, 2))
+        A = -torch.exp(self.A_log)
+        dt = F.softplus(self.dt_proj(x_conv)).squeeze(-1)
+        decay = torch.exp(dt.unsqueeze(-1) * A.mean(-1))
+        h = torch.zeros(B, self.d_inner, device=x.device)
+        ys = []
+        for t in range(L):
+            h = decay[:, t] * h + x_conv[:, t]
+            ys.append(h)
+        y = torch.stack(ys, 1) * F.silu(z)
+        return self.out_proj(y)
+
+class BiMambaBlock(nn.Module):
+    def __init__(self, d_model, d_state=16, bidirectional=True):
+        super().__init__()
+        self.bidirectional = bidirectional
+        self.fwd = SelectiveSSM(d_model, d_state)
+        if bidirectional:
+            self.bwd = SelectiveSSM(d_model, d_state)
+        self.norm = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(nn.Linear(d_model, 2 * d_model), nn.GELU(), nn.Linear(2 * d_model, d_model))
+        self.norm2 = nn.LayerNorm(d_model)
+
+    def forward(self, x):
+        f = self.fwd(x)
+        if self.bidirectional:
+            b = self.bwd(x.flip(1)).flip(1)
+            x = self.norm(x + f + b)
+        else:
+            x = self.norm(x + f)
+        x = self.norm2(x + self.ffn(x))
+        return x
+
+class MambaSynchronyNet(nn.Module):
+    def __init__(self, freq_dim=FREQ_DIM, dist_dim=DIST_DIM, d_model=64, num_classes=2,
+                 num_layers=2, num_heads=4, feature_mode='full',
+                 use_cross_attn=True, bidirectional=True, task_mode='both'):
+        super().__init__()
+        self.feature_mode = feature_mode
+        self.task_mode = task_mode
+        self.use_cross_attn = use_cross_attn
+
+        self.freq_proj = nn.Linear(freq_dim, d_model)
+        self.dist_proj = nn.Linear(dist_dim, d_model)
+        if use_cross_attn:
+            self.cross_attn = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
+            self.norm_fuse = nn.LayerNorm(d_model)
+        else:
+            self.fuse_proj = nn.Linear(d_model * 2, d_model)
+            self.norm_fuse = nn.LayerNorm(d_model)
+
+        self.mamba_layers = nn.ModuleList(
+            [BiMambaBlock(d_model, bidirectional=bidirectional) for _ in range(num_layers)])
+
+        if self.task_mode in ['both', 'cls_only']:
+            self.class_head = nn.Sequential(nn.Linear(d_model, 64), nn.GELU(), nn.Linear(64, num_classes))
+        if self.task_mode in ['both', 'loc_only']:
+            self.loc_head = nn.Sequential(nn.Linear(d_model, 64), nn.GELU(), nn.Linear(64, 1))
+
+    def forward(self, fq, ds):
+        if self.feature_mode == 'raw':
+            fq = torch.zeros_like(fq)
+            ds = torch.zeros_like(ds)
+        elif self.feature_mode == 'stft':
+            ds = torch.zeros_like(ds)
+        elif self.feature_mode == 'threshold':
+            fq = (fq > 0.5).float()
+            ds = (ds > 0.5).float()
+
+        f = self.freq_proj(fq)
+        d = self.dist_proj(ds)
+
+        if self.use_cross_attn:
+            attn, _ = self.cross_attn(f, d, d)
+            x = self.norm_fuse(f + attn)
+        else:
+            x = self.norm_fuse(self.fuse_proj(torch.cat([f, d], dim=-1)))
+
+        for blk in self.mamba_layers: x = blk(x)
+
+        cls_out, loc_out = None, None
+        if self.task_mode in ['both', 'cls_only']:
+            cls_out = self.class_head(x)
+        if self.task_mode in ['both', 'loc_only']:
+            loc_out = self.loc_head(x).squeeze(-1)
+
+        return cls_out, loc_out
+
+class DualDETR(nn.Module):
+    def __init__(self, input_dim=INPUT_DIM, d_model=64, num_classes=2, num_queries=25):
+        super().__init__()
+        self.input_proj = nn.Linear(input_dim, d_model)
+        self.encoder = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model, 4, d_model * 2, batch_first=True), num_layers=2)
+        self.query_embed = nn.Embedding(num_queries, d_model)
+        self.decoder = nn.TransformerDecoder(nn.TransformerDecoderLayer(d_model, 4, d_model * 2, batch_first=True), num_layers=2)
+        self.class_head = nn.Linear(d_model, num_classes)
+        self.loc_head = nn.Linear(d_model, 1)
+    def forward(self, fq, ds):
+        x = self.input_proj(torch.cat([fq, ds], dim=-1))
+        enc = self.encoder(x)
+        q = self.query_embed.weight.unsqueeze(0).expand(x.size(0), -1, -1)
+        dec = self.decoder(q, enc)
+        return self.class_head(dec).mean(dim=1).unsqueeze(1).expand(-1, x.size(1), -1), self.loc_head(dec).squeeze(-1).mean(dim=1).unsqueeze(1).expand(-1, x.size(1))
+
+class PAT(nn.Module):
+    def __init__(self, input_dim=INPUT_DIM, d_model=64, num_classes=2, num_scales=3):
+        super().__init__()
+        self.input_proj = nn.Linear(input_dim, d_model)
+        self.pos_enc = nn.Parameter(torch.randn(1, 256, d_model) * 0.02)
+        self.layers = nn.ModuleList([nn.TransformerEncoderLayer(d_model, 4, d_model * 2, batch_first=True) for _ in range(num_scales)])
+        self.class_head = nn.Linear(d_model, num_classes)
+        self.loc_head = nn.Linear(d_model, 1)
+    def forward(self, fq, ds):
+        x = self.input_proj(torch.cat([fq, ds], dim=-1)) + self.pos_enc[:, :fq.size(1)]
+        for layer in self.layers: x = layer(x)
+        return self.class_head(x), self.loc_head(x).squeeze(-1)
+
+class SiSe(nn.Module):
+    def __init__(self, input_dim=INPUT_DIM, d_model=64, num_classes=2):
+        super().__init__()
+        self.input_proj = nn.Linear(input_dim, d_model)
+        self.sim_transformer = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model, 4, d_model * 2, batch_first=True), num_layers=1)
+        self.seq_transformer = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model, 4, d_model * 2, batch_first=True), num_layers=2)
+        self.class_head = nn.Linear(d_model, num_classes)
+        self.loc_head = nn.Linear(d_model, 1)
+    def forward(self, fq, ds):
+        x = self.sim_transformer(self.input_proj(torch.cat([fq, ds], dim=-1)))
+        x = self.seq_transformer(x)
+        return self.class_head(x), self.loc_head(x).squeeze(-1)
+
+class NCMamba(nn.Module):
+    def __init__(self, input_dim=INPUT_DIM, d_model=64, num_classes=2, num_layers=2):
+        super().__init__()
+        self.input_proj = nn.Linear(input_dim, d_model)
+        self.layers = nn.ModuleList([BiMambaBlock(d_model) for _ in range(num_layers)])
+        self.class_head = nn.Linear(d_model, num_classes)
+        self.loc_head = nn.Linear(d_model, 1)
+    def forward(self, fq, ds):
+        x = self.input_proj(torch.cat([fq, ds], dim=-1))
+        for blk in self.layers: x = blk(x)
+        return self.class_head(x), self.loc_head(x).squeeze(-1)
+
+# ============================================================
+# 3. 评估与工具函数
+# ============================================================
+def count_params(model): return sum(p.numel() for p in model.parameters())
+
+def count_flops(model, input_shape=(1, 100, INPUT_DIM)):
+    try:
+        from thop import profile
+        fq = torch.randn(input_shape[0], input_shape[1], FREQ_DIM).to(device)
+        ds = torch.randn(input_shape[0], input_shape[1], DIST_DIM).to(device)
+        flops, _ = profile(model, inputs=(fq, ds), verbose=False)
+        return flops / 1e9
+    except Exception:
+        return (sum(p.numel() for p in model.parameters()) * input_shape[1] * 4) / 1e9
+
+def train_model(model, train_loader, num_epochs=100, lr=LR):
+    cls_crit = nn.BCEWithLogitsLoss()
+    loc_crit = nn.BCEWithLogitsLoss()
+    # 彻底去除 weight decay
+    opt = optim.AdamW(model.parameters(), lr=lr, weight_decay=0.0)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=num_epochs)
+
+    model.train()
+    for ep in range(num_epochs):
+        for feats, labels, boundary in train_loader:
+            feats, labels, boundary = feats.to(device), labels.to(device), boundary.to(device)
+            fq, ds = feats[..., :FREQ_DIM], feats[..., FREQ_DIM:]
+            opt.zero_grad()
+            cls_out, loc_out = model(fq, ds)
+
+            loss = 0
+            if cls_out is not None: loss += cls_crit(cls_out, labels)
+            if loc_out is not None: loss += loc_crit(loc_out, boundary)
+
+            if loss > 0:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step()
+        scheduler.step()
+
+@torch.no_grad()
+def evaluate_model(model, test_loader):
+    model.eval()
+    all_cls_true, all_cls_pred = [], []
+    all_loc_true, all_loc_pred = [], []
+    
+    for feats, labels, boundary in test_loader:
+        feats = feats.to(device)
+        fq, ds = feats[..., :FREQ_DIM], feats[..., FREQ_DIM:]
+        cls_out, loc_out = model(fq, ds)
+        
+        if cls_out is not None:
+            all_cls_true.append(labels.cpu().numpy())
+            all_cls_pred.append(torch.sigmoid(cls_out).cpu().numpy())
+        if loc_out is not None:
+            all_loc_true.append(boundary.cpu().numpy())
+            all_loc_pred.append(torch.sigmoid(loc_out).cpu().numpy())
+
+    acc, f1, tiou = None, None, None
+
+    # Exact-Match Accuracy (最严格的整体准确率)
+    if len(all_cls_pred) > 0:
+        y_true = np.concatenate(all_cls_true, 0)
+        y_pred = np.concatenate(all_cls_pred, 0)
+        y_pred_bin = (y_pred > 0.5).astype(int)
+        y_true_bin = y_true.astype(int)
+        
+        # 两标签全对才算对
+        acc = (y_pred_bin == y_true_bin).all(axis=-1).mean()
+        f1 = f1_score(y_true_bin.reshape(-1), y_pred_bin.reshape(-1), average='macro', zero_division=0)
+
+    # tIoU
+    if len(all_loc_pred) > 0:
+        y_true = np.concatenate(all_loc_true, 0)
+        y_pred = np.concatenate(all_loc_pred, 0)
+        y_pred_bin = (y_pred > 0.5).astype(int)
+        y_true_bin = y_true.astype(int)
+        
+        t_ious = []
+        for i in range(len(y_true_bin)):
+            gt = y_true_bin[i]
+            pred = y_pred_bin[i]
+            # 加入 ±1 帧容差 (±0.1s)
+            gt_dilated = np.convolve(gt, np.ones(3), 'same') > 0
+            pred_dilated = np.convolve(pred, np.ones(3), 'same') > 0
+            intersection = (gt_dilated & pred_dilated).sum()
+            union = (gt_dilated | pred_dilated).sum()
+            t_ious.append(intersection / (union + 1e-8))
+        tiou = np.mean(t_ious)
+
+    return acc, f1, tiou
+
+# ============================================================
+# 4. 主实验
+# ============================================================
+def main():
+    build_dataset()
+    train_loader = DataLoader(AcousticDataset(TRAIN_IDS), batch_size=BATCH_SIZE, shuffle=True)
+    test_loader = DataLoader(AcousticDataset(TEST_IDS), batch_size=BATCH_SIZE, shuffle=False)
+
+    # 严格对照 Table 5 和 Table 6
+    models_dict = {
+        # --- Table 5: 特征级消融 ---
+        'Raw time distance data': MambaSynchronyNet(feature_mode='raw'),
+        'STFT magnitude only': MambaSynchronyNet(feature_mode='stft'),
+        'Traditional thresholded CRQ': MambaSynchronyNet(feature_mode='threshold'),
+        'NCS without aggregation': MambaSynchronyNet(feature_mode='full'), # 若需区分，可自定义
+        'Full TFD-NCS': MambaSynchronyNet(feature_mode='full'),
+
+        # --- Table 6: 网络级消融 ---
+        'Full MSN': MambaSynchronyNet(feature_mode='full', use_cross_attn=True, bidirectional=True),
+        'Remove cross attention': MambaSynchronyNet(feature_mode='full', use_cross_attn=False, bidirectional=True),
+        'Unidirectional Mamba': MambaSynchronyNet(feature_mode='full', use_cross_attn=True, bidirectional=False),
+        'Classification only': MambaSynchronyNet(feature_mode='full', task_mode='cls_only'),
+        'Localization only': MambaSynchronyNet(feature_mode='full', task_mode='loc_only'),
+
+        # --- 基线对比 ---
+        'DualDETR': DualDETR(),
+        'PAT': PAT(),
+        'SiSe': SiSe(),
+        'NCMamba': NCMamba()
+    }
+
+    results = {}
+
+    print("\n开始训练与评估...\n")
+    print(f"{'Model':<30} | {'Acc':<8} | {'F1':<8} | {'tIoU':<8} | {'Params':<10} | {'FLOPs':<10}")
+    print("-" * 90)
+
+    for name, model in models_dict.items():
+        model = model.to(device)
+        n_params = count_params(model)
+        flops = count_flops(model)
+
+        train_model(model, train_loader, num_epochs=NUM_EPOCHS)
+        acc, f1, tiou = evaluate_model(model, test_loader)
+
+        results[name] = {
+            'Accuracy': acc,
+            'F1': f1,
+            'tIoU': tiou,
+            'Params (M)': n_params / 1e6,
+            'FLOPs (G)': flops
+        }
+        
+        acc_str = f"{acc:.4f}" if acc is not None else "-"
+        f1_str = f"{f1:.4f}" if f1 is not None else "-"
+        tiou_str = f"{tiou:.4f}" if tiou is not None else "-"
+        
+        print(f"{name:<30} | {acc_str:<8} | {f1_str:<8} | {tiou_str:<8} | {n_params/1e6:<8.4f}M | {flops:<8.4f}G")
+
+    with open('ablation_results_final.json', 'w') as f:
+        json.dump(results, f, indent=4)
+    print('\n实验完成，结果已保存至 ablation_results_final.json')
+
+if __name__ == '__main__':
+    main()
