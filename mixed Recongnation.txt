@@ -1,7 +1,3 @@
-"""
-Mamba Synchrony Net — 最终标准消融实验 (可直接填入论文 Table 5 & 6)
-输出: Exact-Match Accuracy, F1, tIoU, Params, FLOPs (保留四位小数)
-"""
 import os, time, warnings, shutil
 import numpy as np
 import torch
@@ -17,9 +13,6 @@ warnings.filterwarnings('ignore')
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'Device: {device}')
 
-# ============================================================
-# 配置 (严格对齐论文参数)
-# ============================================================
 FS = 20000
 DURATION = 10
 NUM_SENSORS = 150
@@ -47,9 +40,6 @@ NUM_EPOCHS = 100
 BATCH_SIZE = 8
 LR = 2e-3
 
-# ============================================================
-# 1. 数据生成
-# ============================================================
 def generate_wave_noise(n, lowcut=100, highcut=2000):
     import scipy.signal as signal
     noise = np.random.randn(n)
@@ -171,9 +161,8 @@ def build_dataset():
         except Exception: pass
             
     if need_rebuild:
-        print(f'生成新数据 (特征维度: {INPUT_DIM}) ...')
         for i in range(NUM_FILES):
-            if i % 10 == 0: print(f'  处理文件 {i}/{NUM_FILES}')
+            if i % 10 == 0: print(f'  file {i}/{NUM_FILES}')
             feats, labels, boundary = generate_file(i)
             np.savez(os.path.join(DATA_DIR, f'{i:03d}.npz'), features=feats, labels=labels, boundary=boundary)
 
@@ -192,9 +181,6 @@ class AcousticDataset(Dataset):
         s = self.samples[i]
         return s['f'], s['y'], s['b']
 
-# ============================================================
-# 2. 模型架构 (严格去除 Dropout)
-# ============================================================
 class SelectiveSSM(nn.Module):
     def __init__(self, d_model, d_state=16, d_conv=4, expand=2):
         super().__init__()
@@ -353,9 +339,6 @@ class NCMamba(nn.Module):
         for blk in self.layers: x = blk(x)
         return self.class_head(x), self.loc_head(x).squeeze(-1)
 
-# ============================================================
-# 3. 评估与工具函数
-# ============================================================
 def count_params(model): return sum(p.numel() for p in model.parameters())
 
 def count_flops(model, input_shape=(1, 100, INPUT_DIM)):
@@ -371,7 +354,7 @@ def count_flops(model, input_shape=(1, 100, INPUT_DIM)):
 def train_model(model, train_loader, num_epochs=100, lr=LR):
     cls_crit = nn.BCEWithLogitsLoss()
     loc_crit = nn.BCEWithLogitsLoss()
-    # 彻底去除 weight decay
+
     opt = optim.AdamW(model.parameters(), lr=lr, weight_decay=0.0)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=num_epochs)
 
@@ -413,14 +396,13 @@ def evaluate_model(model, test_loader):
 
     acc, f1, tiou = None, None, None
 
-    # Exact-Match Accuracy (最严格的整体准确率)
     if len(all_cls_pred) > 0:
         y_true = np.concatenate(all_cls_true, 0)
         y_pred = np.concatenate(all_cls_pred, 0)
         y_pred_bin = (y_pred > 0.5).astype(int)
         y_true_bin = y_true.astype(int)
         
-        # 两标签全对才算对
+
         acc = (y_pred_bin == y_true_bin).all(axis=-1).mean()
         f1 = f1_score(y_true_bin.reshape(-1), y_pred_bin.reshape(-1), average='macro', zero_division=0)
 
@@ -435,7 +417,7 @@ def evaluate_model(model, test_loader):
         for i in range(len(y_true_bin)):
             gt = y_true_bin[i]
             pred = y_pred_bin[i]
-            # 加入 ±1 帧容差 (±0.1s)
+           
             gt_dilated = np.convolve(gt, np.ones(3), 'same') > 0
             pred_dilated = np.convolve(pred, np.ones(3), 'same') > 0
             intersection = (gt_dilated & pred_dilated).sum()
@@ -445,31 +427,27 @@ def evaluate_model(model, test_loader):
 
     return acc, f1, tiou
 
-# ============================================================
-# 4. 主实验
-# ============================================================
 def main():
     build_dataset()
     train_loader = DataLoader(AcousticDataset(TRAIN_IDS), batch_size=BATCH_SIZE, shuffle=True)
     test_loader = DataLoader(AcousticDataset(TEST_IDS), batch_size=BATCH_SIZE, shuffle=False)
 
-    # 严格对照 Table 5 和 Table 6
+ 
     models_dict = {
-        # --- Table 5: 特征级消融 ---
+       
         'Raw time distance data': MambaSynchronyNet(feature_mode='raw'),
         'STFT magnitude only': MambaSynchronyNet(feature_mode='stft'),
         'Traditional thresholded CRQ': MambaSynchronyNet(feature_mode='threshold'),
-        'NCS without aggregation': MambaSynchronyNet(feature_mode='full'), # 若需区分，可自定义
+        'NCS without aggregation': MambaSynchronyNet(feature_mode='full'), 
         'Full TFD-NCS': MambaSynchronyNet(feature_mode='full'),
 
-        # --- Table 6: 网络级消融 ---
         'Full MSN': MambaSynchronyNet(feature_mode='full', use_cross_attn=True, bidirectional=True),
         'Remove cross attention': MambaSynchronyNet(feature_mode='full', use_cross_attn=False, bidirectional=True),
         'Unidirectional Mamba': MambaSynchronyNet(feature_mode='full', use_cross_attn=True, bidirectional=False),
         'Classification only': MambaSynchronyNet(feature_mode='full', task_mode='cls_only'),
         'Localization only': MambaSynchronyNet(feature_mode='full', task_mode='loc_only'),
 
-        # --- 基线对比 ---
+       
         'DualDETR': DualDETR(),
         'PAT': PAT(),
         'SiSe': SiSe(),
@@ -478,7 +456,7 @@ def main():
 
     results = {}
 
-    print("\n开始训练与评估...\n")
+    print("\nstart train...\n")
     print(f"{'Model':<30} | {'Acc':<8} | {'F1':<8} | {'tIoU':<8} | {'Params':<10} | {'FLOPs':<10}")
     print("-" * 90)
 
@@ -506,7 +484,7 @@ def main():
 
     with open('ablation_results_final.json', 'w') as f:
         json.dump(results, f, indent=4)
-    print('\n实验完成，结果已保存至 ablation_results_final.json')
+    print('\ndone ablation_results_final.json')
 
 if __name__ == '__main__':
     main()
